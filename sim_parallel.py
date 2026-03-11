@@ -905,6 +905,109 @@ class TopWordsTopicModel:
         self.vocab_precision = 0.0
         self.vocab_recall = 0.0
 
+    def greedy_segment(self, text):
+        """Baseline tokenizer: greedy maximum matching by dictionary."""
+        res = []
+        i = 0
+        L = len(text)
+        while i < L:
+            found = False
+            for l in range(min(self.max_w_len, L - i), 0, -1):
+                w = text[i : i + l]
+                if w in self.word_map:
+                    res.append(w)
+                    i += l
+                    found = True
+                    break
+            if not found:
+                res.append(text[i : i + 1])
+                i += 1
+        return res
+
+    def evaluate_with_segmenter(self, corpus, segmenter):
+        confusion = np.zeros((self.K, self.K))
+        for d_idx, doc in enumerate(corpus):
+            pred_t = np.argmax(self.theta[d_idx])
+            for sent in doc["sentences"]:
+                gt_t = sent["gt_topic"] - 1
+                confusion[pred_t, gt_t] += 1
+
+        row_ind, col_ind = linear_sum_assignment(-confusion)
+        topic_map = {row: col + 1 for row, col in zip(row_ind, col_ind)}
+
+        seg_f1, topic_acc = [], []
+        for d_idx, doc in enumerate(corpus):
+            pred_t_raw = np.argmax(self.theta[d_idx])
+            pred_t_mapped = topic_map.get(pred_t_raw, -1)
+            for sent in doc["sentences"]:
+                topic_acc.append(1 if pred_t_mapped == sent["gt_topic"] else 0)
+                pred_seg = segmenter(sent["text"])
+                gt_set = set(sent["gt_seg"])
+                pred_set = set(pred_seg)
+                common = len(gt_set & pred_set)
+                p = common / len(pred_set) if pred_set else 0
+                r = common / len(gt_set) if gt_set else 0
+                seg_f1.append(2 * p * r / (p + r) if (p + r) > 0 else 0)
+        return {
+            "f1": float(np.mean(seg_f1)) if seg_f1 else 0.0,
+            "topic_acc": float(np.mean(topic_acc)) if topic_acc else 0.0,
+        }
+
+    def train_baseline_lda(self, corpus, iterations=10):
+        """Baseline: greedy segmentation + sentence-level LDA-style EM."""
+        D = len(corpus)
+        tokenized_corpus = []
+        for d in range(D):
+            tokenized_corpus.append(
+                [self.greedy_segment(sent["text"]) for sent in corpus[d]["sentences"]]
+            )
+
+        self.theta = np.random.dirichlet([self.alpha_p] * self.K, size=D)
+        self.history = {"likelihood": [], "f1": [], "topic_acc": []}
+
+        for it in range(iterations):
+            start_time = time.time()
+            new_n_ti = np.zeros((self.K, self.V))
+            new_n_dt = np.zeros((D, self.K))
+            total_likelihood = 0.0
+
+            log_phi_all = np.log(self.phi[1:] + 1e-20)
+            for d in range(D):
+                for tokens in tokenized_corpus[d]:
+                    indices = [self.word_map[w] for w in tokens if w in self.word_map]
+                    if not indices:
+                        continue
+
+                    log_G = np.sum(log_phi_all[:, indices], axis=1)
+                    log_post = log_G + np.log(self.theta[d] + 1e-20)
+                    lse = logsumexp(log_post)
+                    post_z = np.exp(log_post - lse)
+
+                    new_n_dt[d] += post_z
+                    total_likelihood += float(lse)
+                    for t in range(self.K):
+                        for idx in indices:
+                            new_n_ti[t][idx] += post_z[t]
+
+            for t in range(self.K):
+                self.phi[t + 1] = (new_n_ti[t] + self.beta_p) / (
+                    np.sum(new_n_ti[t]) + self.V * self.beta_p + 1e-20
+                )
+            for d in range(D):
+                self.theta[d] = (new_n_dt[d] + self.alpha_p) / (
+                    np.sum(new_n_dt[d]) + self.K * self.alpha_p + 1e-20
+                )
+
+            metrics = self.evaluate_with_segmenter(corpus, self.greedy_segment)
+            metrics["likelihood"] = total_likelihood
+            for k, v in metrics.items():
+                self.history[k].append(v)
+
+            duration = time.time() - start_time
+            logger.info(
+                f"Baseline Iter {it} | Likelihood: {total_likelihood:.2f} | F1: {metrics['f1']:.4f} | Topic Acc: {metrics['topic_acc']:.4f} | Time: {duration:.2f}s"
+            )
+
     def viterbi_segment(self, text, d_idx, n_idx, pi_val):
         t_idx = np.argmax(self.theta[d_idx])
         log_g = np.log(
@@ -1468,6 +1571,155 @@ def run_test(
     return {"f1": model.history["f1"][-1], "topic_acc": model.history["topic_acc"][-1]}
 
 
+def run_baseline_comparison(
+    num_topics=2,
+    char_size=500,
+    vocab_size=1000,
+    max_word_len=4,
+    single_char_ratio=0.3,
+    alpha=0.1,
+    beta=0.01,
+    num_docs=1000,
+    sents_per_doc=10,
+    iterations=10,
+    num_workers=4,
+    timestamp=None,
+    tol=0.0001,
+    use_threads=False,
+    min_iters_before_stop=5,
+    early_stop_patience=5,
+    vocab_strategy="discover",
+    vocab_min_freq=2,
+    vocab_max_candidates=None,
+):
+    _ensure_logger(timestamp=timestamp)
+    logger.info("=== Starting Baseline Comparison ===")
+
+    sim = TopWordsTopicSimulator(
+        num_topics=num_topics,
+        char_size=char_size,
+        vocab_size=vocab_size,
+        max_word_len=max_word_len,
+        single_char_ratio=single_char_ratio,
+        alpha=alpha,
+        beta=beta,
+    )
+    corpus = sim.generate_corpus(num_docs=num_docs, sents_per_doc=sents_per_doc)
+
+    if vocab_strategy == "discover":
+        model_dictionary, discovery_stats = sim.discover_vocabulary(
+            corpus,
+            min_freq=vocab_min_freq,
+            max_candidates=vocab_max_candidates,
+        )
+    elif vocab_strategy == "oracle":
+        model_dictionary = list(sim.word_dict)
+        discovery_stats = None
+    else:
+        raise ValueError(
+            f"Unknown vocab_strategy: {vocab_strategy}. Expected 'discover' or 'oracle'."
+        )
+
+    gt_pi_values = np.array(
+        [sent["gt_pi"] for doc in corpus for sent in doc["sentences"]], dtype=float
+    )
+
+    model_main = TopWordsTopicModel(model_dictionary, K=num_topics)
+    model_main.gt_pi_values = gt_pi_values
+
+    true_vocab_set = set(sim.word_dict)
+    model_vocab_set = set(model_dictionary)
+    overlap = len(true_vocab_set & model_vocab_set)
+    model_main.vocab_precision = overlap / max(len(model_vocab_set), 1)
+    model_main.vocab_recall = overlap / max(len(true_vocab_set), 1)
+
+    model_main.train(
+        corpus,
+        iterations=iterations,
+        num_workers=num_workers,
+        tol=tol,
+        use_threads=use_threads,
+        min_iters_before_stop=min_iters_before_stop,
+        early_stop_patience=early_stop_patience,
+    )
+    main_res = {
+        "f1": model_main.history["f1"][-1],
+        "topic_acc": model_main.history["topic_acc"][-1],
+    }
+
+    model_base = TopWordsTopicModel(model_dictionary, K=num_topics)
+    model_base.train_baseline_lda(corpus, iterations=iterations)
+    dummy_pi = [[0.5 for _ in d["sentences"]] for d in corpus]
+    base_eval_viterbi = model_base.evaluate(corpus, dummy_pi)
+    base_res = {
+        "f1_greedy": model_base.history["f1"][-1],
+        "f1_viterbi": base_eval_viterbi["f1"],
+        "topic_acc": base_eval_viterbi["topic_acc"],
+    }
+
+    fig = plt.figure(figsize=(9.5, 5.6), facecolor="white")
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax2 = fig.add_subplot(1, 2, 2)
+    labels = ["TopWords", "Baseline"]
+    f1_vals = [main_res["f1"], base_res["f1_viterbi"]]
+    acc_vals = [main_res["topic_acc"], base_res["topic_acc"]]
+    colors = ["#1982c4", "#8ac926"]
+
+    ax1.bar(labels, f1_vals, color=colors, alpha=0.9)
+    ax1.set_ylim(0, 1.0)
+    ax1.set_title("Segmentation F1", fontsize=13, fontweight="bold")
+    _style_axis(ax1, "Model", "F1")
+    for i, v in enumerate(f1_vals):
+        ax1.text(i, v + 0.02, f"{v:.4f}", ha="center", fontsize=10)
+
+    ax2.bar(labels, acc_vals, color=colors, alpha=0.9)
+    ax2.set_ylim(0, 1.0)
+    ax2.set_title("Topic Accuracy", fontsize=13, fontweight="bold")
+    _style_axis(ax2, "Model", "Accuracy")
+    for i, v in enumerate(acc_vals):
+        ax2.text(i, v + 0.02, f"{v:.4f}", ha="center", fontsize=10)
+
+    fig.suptitle("TopWords vs Baseline", fontsize=16, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    plot_dir = "results/plot/compare"
+    if not os.path.exists(plot_dir):
+        os.makedirs(plot_dir)
+    plot_path = os.path.join(plot_dir, f"baseline_compare_{timestamp}.png")
+    _save_figure(fig, plot_path)
+    plt.close(fig)
+
+    summary = [
+        f"docs={num_docs}, topics={num_topics}, iterations={iterations}",
+        f"vocab_strategy={vocab_strategy}, vocab_size={len(model_dictionary)}, overlap={overlap}/{len(sim.word_dict)}",
+        f"TopWords: f1={main_res['f1']:.4f}, topic_acc={main_res['topic_acc']:.4f}",
+        (
+            "Baseline: "
+            f"f1_greedy={base_res['f1_greedy']:.4f}, "
+            f"f1_viterbi={base_res['f1_viterbi']:.4f}, "
+            f"topic_acc={base_res['topic_acc']:.4f}"
+        ),
+        f"delta(topwords-baseline_viterbi): f1={main_res['f1'] - base_res['f1_viterbi']:+.4f}, topic_acc={main_res['topic_acc'] - base_res['topic_acc']:+.4f}",
+    ]
+    if discovery_stats is not None:
+        summary.insert(
+            2,
+            (
+                "discovery_stats: "
+                f"candidates={discovery_stats['candidate_total']}, "
+                f"after_freq={discovery_stats['after_freq_filter']}, "
+                f"selected={discovery_stats['selected_size']}"
+            ),
+        )
+    summary.append(f"plot_path: {plot_path}")
+    summary.append(f"log_file: {_get_log_file_path()}")
+    logger.info(_build_summary_text("Baseline Comparison Summary", *summary))
+
+    return {"topwords": main_res, "baseline": base_res, "plot_path": plot_path}
+
+
 def run_distribution_test(n_runs=100, timestamp=None, **kwargs):
     _ensure_logger(timestamp=timestamp)
 
@@ -1707,7 +1959,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--mode", type=str, default="single", choices=["single", "dist", "compare"]
+        "--mode",
+        type=str,
+        default="single",
+        choices=["single", "dist", "compare", "baseline"],
     )
     parser.add_argument(
         "--runs",
@@ -1838,6 +2093,8 @@ if __name__ == "__main__":
             timestamp=unified_timestamp,
             **sim_params,
         )
+    elif args.mode == "baseline":
+        run_baseline_comparison(timestamp=unified_timestamp, **sim_params)
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
 
