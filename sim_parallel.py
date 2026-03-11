@@ -487,7 +487,9 @@ class TopWordsTopicSimulator:
             discovered = fallback_chars[: max(10, min(self.char_size, 100))]
 
         if not discovered:
-            discovered = list(self.true_word_dict)
+            raise ValueError(
+                "Vocabulary discovery failed: no candidate substrings found in corpus."
+            )
 
         stats = {
             "candidate_total": len(ngram_counts),
@@ -978,6 +980,12 @@ def run_test(
     )
     corpus = sim.generate_corpus(num_docs=num_docs, sents_per_doc=sents_per_doc)
 
+    if vocab_strategy == "discover" and num_docs < 100 and vocab_min_freq > 1:
+        logger.warning(
+            "Small corpus with strict vocab_min_freq may drop many true words: "
+            f"num_docs={num_docs}, vocab_min_freq={vocab_min_freq}"
+        )
+
     discovery_stats = None
     if vocab_strategy == "discover":
         model_dictionary, discovery_stats = sim.discover_vocabulary(
@@ -1351,7 +1359,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--vocab_max_candidates",
         type=int,
-        default=1000,
+        default=0,
         help="Maximum vocabulary size after frequency filtering (0 means unlimited)",
     )
     parser.add_argument(
