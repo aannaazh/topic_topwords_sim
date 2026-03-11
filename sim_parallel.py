@@ -159,9 +159,9 @@ def _plot_training_metric(
     )
     ax.axhline(series[-1], color=color, linestyle="--", linewidth=1.1, alpha=0.35)
 
-    annotation = f"Final: {series[-1]:.3f}"
+    annotation = f"Final: {series[-1]:.4g}"
     if series.size > 1:
-        annotation += f"\nΔ vs prev: {series[-1] - series[-2]:+.3f}"
+        annotation += f"\nΔprev: {series[-1] - series[-2]:+.4g}"
 
     ax.annotate(
         annotation,
@@ -183,7 +183,7 @@ def _plot_training_metric(
             ax.text(
                 0.03,
                 0.95,
-                f"Stop criterion met\nΔ={relative_change:.2%} < tol {tol:.2%}",
+                f"Δ={relative_change:.2%}\ntol={tol:.1e}",
                 transform=ax.transAxes,
                 va="top",
                 fontsize=10,
@@ -193,6 +193,274 @@ def _plot_training_metric(
     ax.set_title(title, fontsize=14, fontweight="bold")
     _style_axis(ax, "Iteration", ylabel)
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+
+def _compute_vocab_learning_metrics(phi):
+    """Compute compact vocabulary-learning indicators from topic-word distributions."""
+    if phi.shape[1] == 0:
+        return 0.0, 0.0, np.array([])
+
+    topic_phi = phi[1:]
+    if topic_phi.size == 0:
+        return 0.0, 0.0, np.array([])
+
+    topic_count = topic_phi.shape[0]
+    vocab_size = topic_phi.shape[1]
+    log_vocab = np.log(max(vocab_size, 2))
+
+    entropies = -np.sum(topic_phi * np.log(topic_phi + 1e-20), axis=1)
+    entropies_norm = entropies / log_vocab
+    normalized_entropy = float(np.mean(entropies_norm))
+
+    effective_sizes = []
+    for row in topic_phi:
+        sorted_probs = np.sort(row)[::-1]
+        cumulative = np.cumsum(sorted_probs)
+        effective_size = int(np.searchsorted(cumulative, 0.95) + 1)
+        effective_sizes.append(effective_size)
+
+    mean_effective_ratio = float(np.mean(effective_sizes) / max(vocab_size, 1))
+    return normalized_entropy, mean_effective_ratio, entropies_norm
+
+
+def _plot_vocab_learning_panel(ax, x_values, entropy_values, effective_ratio_values):
+    entropy_series = np.asarray(entropy_values, dtype=float)
+    effective_series = np.asarray(effective_ratio_values, dtype=float)
+    if entropy_series.size == 0 or effective_series.size == 0:
+        return
+
+    ax.plot(
+        x_values,
+        entropy_series,
+        color="#6a4c93",
+        linewidth=2.2,
+        marker="o",
+        markersize=5,
+        label="Mean normalized entropy",
+    )
+    ax.plot(
+        x_values,
+        effective_series,
+        color="#1982c4",
+        linewidth=2.2,
+        marker="D",
+        markersize=5,
+        label="95% mass vocab ratio",
+    )
+
+    ax.fill_between(x_values, entropy_series, color="#6a4c93", alpha=0.08)
+    ax.fill_between(x_values, effective_series, color="#1982c4", alpha=0.08)
+
+    ax.annotate(
+        f"entropy {entropy_series[-1]:.3f}",
+        xy=(x_values[-1], entropy_series[-1]),
+        xytext=(8, 10),
+        textcoords="offset points",
+        fontsize=9,
+        color="#4a2f69",
+    )
+    ax.annotate(
+        f"ratio {effective_series[-1]:.3f}",
+        xy=(x_values[-1], effective_series[-1]),
+        xytext=(8, -14),
+        textcoords="offset points",
+        fontsize=9,
+        color="#125f90",
+    )
+
+    ax.set_title("Vocabulary Learning Dynamics", fontsize=14, fontweight="bold")
+    _style_axis(ax, "Iteration", "Normalized value")
+    ax.set_ylim(0, 1.05)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.legend(loc="best", fontsize=9, frameon=True)
+
+
+def _plot_phase_portrait(ax, f1_values, topic_acc_values, entropy_values):
+    f1_series = np.asarray(f1_values, dtype=float)
+    acc_series = np.asarray(topic_acc_values, dtype=float)
+    entropy_series = np.asarray(entropy_values, dtype=float)
+    if f1_series.size == 0 or acc_series.size == 0:
+        return
+
+    steps = np.arange(1, f1_series.size + 1)
+    scatter = ax.scatter(
+        f1_series,
+        acc_series,
+        c=entropy_series if entropy_series.size == f1_series.size else steps,
+        cmap="viridis_r",
+        s=70,
+        alpha=0.88,
+        edgecolors="white",
+        linewidths=0.7,
+        zorder=3,
+    )
+    ax.plot(f1_series, acc_series, color="#4d4d4d", linewidth=1.4, alpha=0.75, zorder=2)
+
+    ax.scatter(
+        [f1_series[0]],
+        [acc_series[0]],
+        marker="s",
+        s=90,
+        color="#ff595e",
+        label="Start",
+        zorder=4,
+    )
+    ax.scatter(
+        [f1_series[-1]],
+        [acc_series[-1]],
+        marker="*",
+        s=130,
+        color="#1982c4",
+        label="End",
+        zorder=4,
+    )
+
+    cbar = ax.figure.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Topic entropy", fontsize=10)
+
+    ax.set_title(
+        "Learning Phase Portrait (F1 vs Topic Accuracy)", fontsize=15, fontweight="bold"
+    )
+    _style_axis(ax, "Segmentation F1", "Topic Accuracy")
+    ax.legend(loc="lower right", fontsize=9, frameon=True)
+    for idx in (0, max(len(steps) // 2, 0), len(steps) - 1):
+        ax.annotate(
+            f"it{steps[idx]}",
+            (f1_series[idx], acc_series[idx]),
+            textcoords="offset points",
+            xytext=(8, 6),
+            fontsize=8.5,
+            color="#333333",
+        )
+
+
+def _plot_confusion_heatmap(ax, confusion_matrix):
+    if confusion_matrix is None or np.asarray(confusion_matrix).size == 0:
+        ax.text(0.5, 0.5, "No confusion data", ha="center", va="center", fontsize=11)
+        ax.axis("off")
+        return
+
+    matrix = np.asarray(confusion_matrix, dtype=float)
+    labels = [f"T{i + 1}" for i in range(matrix.shape[0])]
+    sns.heatmap(
+        matrix,
+        annot=True,
+        fmt=".0f",
+        cmap="YlGnBu",
+        linewidths=0.4,
+        linecolor="white",
+        xticklabels=labels,
+        yticklabels=labels,
+        ax=ax,
+    )
+    ax.set_title("Topic Confusion (Hungarian-aligned)", fontsize=14, fontweight="bold")
+    _style_axis(ax, "Ground-truth topic", "Predicted topic")
+
+
+def _plot_pi_distribution(ax, pi_values, gt_pi_values=None):
+    pi_series = np.asarray(pi_values, dtype=float)
+    if pi_series.size == 0:
+        ax.text(0.5, 0.5, "No pi data", ha="center", va="center", fontsize=11)
+        ax.axis("off")
+        return
+
+    bins = np.linspace(0, 1, 26)
+    ax.hist(
+        pi_series,
+        bins=bins,
+        alpha=0.65,
+        color="#1982c4",
+        edgecolor="white",
+        linewidth=0.8,
+        label="Predicted pi",
+    )
+
+    if gt_pi_values is not None and np.asarray(gt_pi_values).size > 0:
+        gt_series = np.asarray(gt_pi_values, dtype=float)
+        ax.hist(
+            gt_series,
+            bins=bins,
+            alpha=0.42,
+            color="#ff595e",
+            edgecolor="white",
+            linewidth=0.8,
+            label="Ground-truth pi",
+        )
+
+    ax.axvline(
+        float(np.mean(pi_series)), color="#0b4f7c", linestyle="--", linewidth=1.4
+    )
+    ax.set_title(
+        "Sentence Mixing Ratio (pi) Distribution", fontsize=14, fontweight="bold"
+    )
+    _style_axis(ax, "pi value", "Sentence count")
+    ax.set_xlim(0, 1)
+    ax.legend(loc="best", fontsize=9, frameon=True)
+
+
+def _plot_entropy_by_topic(ax, entropy_by_topic_history):
+    if not entropy_by_topic_history:
+        ax.text(0.5, 0.5, "No entropy-by-topic history", ha="center", va="center")
+        ax.axis("off")
+        return
+
+    matrix = np.asarray(entropy_by_topic_history, dtype=float)
+    if matrix.ndim != 2 or matrix.size == 0:
+        ax.text(0.5, 0.5, "Invalid entropy history", ha="center", va="center")
+        ax.axis("off")
+        return
+
+    iterations = np.arange(1, matrix.shape[0] + 1)
+    for topic_idx in range(matrix.shape[1]):
+        ax.plot(
+            iterations,
+            matrix[:, topic_idx],
+            linewidth=1.5,
+            alpha=0.82,
+            label=f"T{topic_idx + 1}",
+        )
+
+    ax.set_title("Per-topic Entropy Trajectories", fontsize=14, fontweight="bold")
+    _style_axis(ax, "Iteration", "Normalized entropy")
+    ax.set_ylim(0, 1.05)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    if matrix.shape[1] <= 8:
+        ax.legend(loc="best", fontsize=8, ncol=2, frameon=True)
+
+
+def _plot_vocab_pr_panel(ax, vocab_precision, vocab_recall):
+    if vocab_precision is None or vocab_recall is None:
+        ax.text(0.5, 0.5, "No vocab precision/recall", ha="center", va="center")
+        ax.axis("off")
+        return
+
+    p = float(vocab_precision)
+    r = float(vocab_recall)
+    f1 = 2 * p * r / max(p + r, 1e-12)
+
+    xs = np.linspace(0.001, 1.0, 200)
+    for iso in (0.2, 0.4, 0.6, 0.8):
+        ys = (iso * xs) / np.maximum(2 * xs - iso, 1e-12)
+        ys[(2 * xs - iso) <= 0] = np.nan
+        ys = np.clip(ys, 0, 1)
+        ax.plot(xs, ys, color="#c7c7c7", linewidth=0.8, alpha=0.65)
+
+    ax.scatter([r], [p], s=120, color="#6a4c93", edgecolors="white", linewidths=0.8)
+    ax.annotate(
+        f"P={p:.3f}\nR={r:.3f}\nF1={f1:.3f}",
+        xy=(r, p),
+        xytext=(10, 10),
+        textcoords="offset points",
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.9),
+    )
+
+    ax.set_title(
+        "Vocabulary Recovery (Precision vs Recall)", fontsize=14, fontweight="bold"
+    )
+    _style_axis(ax, "Recall", "Precision")
+    ax.set_xlim(0, 1.02)
+    ax.set_ylim(0, 1.02)
 
 
 def _plot_distribution_panel(ax_hist, ax_box, values, title, xlabel, color):
@@ -631,6 +899,11 @@ class TopWordsTopicModel:
         self.phi = np.random.dirichlet([self.beta_p] * self.V, size=self.K + 1)
         self.word_map = {w: i for i, w in enumerate(self.W)}
         self.max_w_len = max(len(w) for w in self.W)
+        self.latest_mapped_confusion = None
+        self.latest_pi_values = np.array([], dtype=float)
+        self.gt_pi_values = np.array([], dtype=float)
+        self.vocab_precision = 0.0
+        self.vocab_recall = 0.0
 
     def viterbi_segment(self, text, d_idx, n_idx, pi_val):
         t_idx = np.argmax(self.theta[d_idx])
@@ -669,7 +942,17 @@ class TopWordsTopicModel:
         D = len(corpus)
         self.theta = np.random.dirichlet([self.alpha_p] * self.K, size=D)
         pi = [[0.5 for _ in d["sentences"]] for d in corpus]
-        self.history = {"likelihood": [], "f1": [], "topic_acc": []}
+        self.history = {
+            "likelihood": [],
+            "f1": [],
+            "topic_acc": [],
+            "topic_entropy": [],
+            "effective_vocab95": [],
+            "topic_entropy_by_topic": [],
+            "pi_mean": [],
+            "pi_p10": [],
+            "pi_p90": [],
+        }
         no_improve_steps = 0
 
         for it in range(iterations):
@@ -728,14 +1011,32 @@ class TopWordsTopicModel:
                     )
                     pi[d][n] = numer / (denom + 1e-20)
 
+            pi_flat = np.concatenate(
+                [np.asarray(sent_pi, dtype=float) for sent_pi in pi if len(sent_pi) > 0]
+            )
+            self.latest_pi_values = pi_flat
+
             metrics = self.evaluate(corpus, pi)
             metrics["likelihood"] = total_likelihood
+            topic_entropy, effective_vocab95, entropy_by_topic = (
+                _compute_vocab_learning_metrics(self.phi)
+            )
+            metrics["topic_entropy"] = topic_entropy
+            metrics["effective_vocab95"] = effective_vocab95
+            metrics["topic_entropy_by_topic"] = entropy_by_topic.tolist()
+            metrics["pi_mean"] = float(np.mean(pi_flat)) if pi_flat.size else 0.0
+            metrics["pi_p10"] = (
+                float(np.percentile(pi_flat, 10)) if pi_flat.size else 0.0
+            )
+            metrics["pi_p90"] = (
+                float(np.percentile(pi_flat, 90)) if pi_flat.size else 0.0
+            )
             for k, v in metrics.items():
                 self.history[k].append(v)
 
             duration = time.time() - start_time
             logger.info(
-                f"Iteration {it} | Likelihood: {total_likelihood:.2f} | F1: {metrics['f1']:.4f} | Topic Acc: {metrics['topic_acc']:.4f} | Time: {duration:.2f}s"
+                f"Iteration {it} | Likelihood: {total_likelihood:.2f} | F1: {metrics['f1']:.4f} | Topic Acc: {metrics['topic_acc']:.4f} | Entropy: {metrics['topic_entropy']:.4f} | EffVocab95: {metrics['effective_vocab95']:.4f} | Time: {duration:.2f}s"
             )
 
             # Early stopping check
@@ -817,6 +1118,7 @@ class TopWordsTopicModel:
 
         row_ind, col_ind = linear_sum_assignment(-confusion)
         topic_map = {row: col + 1 for row, col in zip(row_ind, col_ind)}
+        self.latest_mapped_confusion = confusion[row_ind][:, col_ind]
 
         seg_f1, topic_acc = [], []
         for d_idx, doc in enumerate(corpus):
@@ -837,15 +1139,17 @@ class TopWordsTopicModel:
 
     def plot_metrics(self, save_path="training_metrics.png", params=None):
         iterations = np.arange(1, len(self.history["likelihood"]) + 1)
-        fig = plt.figure(figsize=(19, 6.8), facecolor="white")
+        fig = plt.figure(figsize=(20.0, 11.5), facecolor="white")
         fig.suptitle(
             "Single-Run Training Metrics",
             fontsize=18,
             fontweight="bold",
-            y=0.995,
+            y=0.985,
         )
 
-        ax1 = fig.add_subplot(1, 3, 1)
+        grid = fig.add_gridspec(3, 3)
+
+        ax1 = fig.add_subplot(grid[0, 0])
         _plot_training_metric(
             ax1,
             iterations,
@@ -857,7 +1161,7 @@ class TopWordsTopicModel:
             show_convergence=True,
         )
 
-        ax2 = fig.add_subplot(1, 3, 2)
+        ax2 = fig.add_subplot(grid[0, 1])
         _plot_training_metric(
             ax2,
             iterations,
@@ -867,7 +1171,7 @@ class TopWordsTopicModel:
             "forestgreen",
         )
 
-        ax3 = fig.add_subplot(1, 3, 3)
+        ax3 = fig.add_subplot(grid[0, 2])
         _plot_training_metric(
             ax3,
             iterations,
@@ -877,23 +1181,63 @@ class TopWordsTopicModel:
             "darkorange",
         )
 
+        ax4 = fig.add_subplot(grid[1, 0])
+        _plot_vocab_learning_panel(
+            ax4,
+            iterations,
+            self.history.get("topic_entropy", []),
+            self.history.get("effective_vocab95", []),
+        )
+
+        ax5 = fig.add_subplot(grid[1, 1])
+        _plot_phase_portrait(
+            ax5,
+            self.history["f1"],
+            self.history["topic_acc"],
+            self.history.get("topic_entropy", []),
+        )
+
+        ax6 = fig.add_subplot(grid[1, 2])
+        _plot_confusion_heatmap(ax6, self.latest_mapped_confusion)
+
+        ax7 = fig.add_subplot(grid[2, 0])
+        _plot_pi_distribution(ax7, self.latest_pi_values, self.gt_pi_values)
+
+        ax8 = fig.add_subplot(grid[2, 1])
+        _plot_entropy_by_topic(ax8, self.history.get("topic_entropy_by_topic", []))
+
+        ax9 = fig.add_subplot(grid[2, 2])
+        _plot_vocab_pr_panel(
+            ax9,
+            getattr(self, "vocab_precision", None),
+            getattr(self, "vocab_recall", None),
+        )
+
         param_str = _build_param_text(
             params, title="Run Parameters", exclude_keys={"num_workers"}
         )
         if param_str:
             fig.text(
-                0.985,
+                0.815,
                 0.5,
                 param_str,
                 va="center",
-                ha="right",
-                fontsize=10,
-                bbox=dict(boxstyle="round,pad=0.7", facecolor="wheat", alpha=0.28),
+                ha="left",
+                fontsize=9.0,
+                bbox=dict(boxstyle="round,pad=0.45", facecolor="#fff7dc", alpha=0.92),
             )
 
-        fig.tight_layout(rect=[0, 0, 0.88, 0.96])
+        fig.subplots_adjust(
+            left=0.04,
+            right=0.79,
+            top=0.93,
+            bottom=0.06,
+            wspace=0.28,
+            hspace=0.34,
+        )
         _save_figure(fig, save_path)
         plt.close(fig)
+        return save_path
 
 
 import seaborn as sns
@@ -994,6 +1338,7 @@ def run_test(
         "vocab_min_freq": vocab_min_freq,
         "vocab_max_candidates": vocab_max_candidates,
     }
+
     logger.info(_build_summary_text("Starting Single Run", f"params: {params}"))
 
     sim = TopWordsTopicSimulator(
@@ -1006,6 +1351,9 @@ def run_test(
         beta=beta,
     )
     corpus = sim.generate_corpus(num_docs=num_docs, sents_per_doc=sents_per_doc)
+    gt_pi_values = np.array(
+        [sent["gt_pi"] for doc in corpus for sent in doc["sentences"]], dtype=float
+    )
 
     if vocab_strategy == "discover" and num_docs < 100 and vocab_min_freq > 1:
         logger.warning(
@@ -1028,6 +1376,7 @@ def run_test(
         )
 
     model = TopWordsTopicModel(model_dictionary, K=num_topics)
+    model.gt_pi_values = gt_pi_values
     model.train(
         corpus,
         iterations=iterations,
@@ -1058,6 +1407,15 @@ def run_test(
         "vocab_max_candidates": vocab_max_candidates,
     }
 
+    true_vocab_set = set(sim.word_dict)
+    model_vocab_set = set(model_dictionary)
+    overlap = len(true_vocab_set & model_vocab_set)
+    overlap_ratio = overlap / max(len(true_vocab_set), 1)
+    vocab_precision = overlap / max(len(model_vocab_set), 1)
+    vocab_recall = overlap / max(len(true_vocab_set), 1)
+    model.vocab_precision = vocab_precision
+    model.vocab_recall = vocab_recall
+
     plot_path = None
     if plot:
         if timestamp is None:
@@ -1066,15 +1424,11 @@ def run_test(
         if not os.path.exists(plot_dir):
             os.makedirs(plot_dir)
         plot_path = os.path.join(plot_dir, f"metrics_{timestamp}.png")
-        model.plot_metrics(save_path=plot_path, params=params)
+        plot_path = model.plot_metrics(save_path=plot_path, params=params)
         logger.info(f"Single run plot saved to {plot_path}")
 
     completed_iterations = len(model.history["likelihood"])
     likelihood_change = _compute_relative_change(model.history["likelihood"])
-    true_vocab_set = set(sim.word_dict)
-    model_vocab_set = set(model_dictionary)
-    overlap = len(true_vocab_set & model_vocab_set)
-    overlap_ratio = overlap / max(len(true_vocab_set), 1)
 
     summary_lines = [
         f"iterations_completed: {completed_iterations}/{iterations}",
@@ -1089,6 +1443,11 @@ def run_test(
         ),
         f"final_f1: {model.history['f1'][-1]:.4f}",
         f"final_topic_acc: {model.history['topic_acc'][-1]:.4f}",
+        f"final_topic_entropy: {model.history['topic_entropy'][-1]:.4f}",
+        f"final_effective_vocab95: {model.history['effective_vocab95'][-1]:.4f}",
+        f"final_vocab_precision_recall: {vocab_precision:.4f}/{vocab_recall:.4f}",
+        f"final_pi_mean: {model.history['pi_mean'][-1]:.4f}",
+        f"final_pi_p10_p90: {model.history['pi_p10'][-1]:.4f}-{model.history['pi_p90'][-1]:.4f}",
         f"plot_path: {_format_plot_path(plot_path)}",
         f"log_file: {_get_log_file_path()}",
     ]
