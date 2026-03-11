@@ -2,6 +2,7 @@ import numpy as np
 import random
 from scipy.special import logsumexp
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 from scipy.optimize import linear_sum_assignment
 import concurrent.futures
 import time
@@ -18,27 +19,356 @@ plt.style.use("bmh")
 # ==========================================
 # 0. 日志系统设置 (Logging)
 # ==========================================
+LOGGER_NAME = "sim_parallel"
+LOGGER_FILE_PATH = None
+
+
 def setup_logger(log_dir="log", timestamp=None):
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
+    global logger, LOGGER_FILE_PATH
+
+    os.makedirs(log_dir, exist_ok=True)
+
+    configured_logger = logging.getLogger(LOGGER_NAME)
+    current_log_file = LOGGER_FILE_PATH
+
+    if timestamp is None and current_log_file and configured_logger.handlers:
+        logger = configured_logger
+        return configured_logger
 
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(log_dir, f"sim_{timestamp}.log")
 
-    logging.basicConfig(
-        level="INFO",
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=[
-            RichHandler(rich_tracebacks=True),
-            logging.FileHandler(log_file, encoding="utf-8"),
-        ],
+    if current_log_file == log_file and configured_logger.handlers:
+        logger = configured_logger
+        return configured_logger
+
+    configured_logger.setLevel(logging.INFO)
+    configured_logger.propagate = False
+
+    for handler in list(configured_logger.handlers):
+        configured_logger.removeHandler(handler)
+        handler.close()
+
+    console_handler = RichHandler(rich_tracebacks=True)
+    console_handler.setFormatter(logging.Formatter("%(message)s", datefmt="[%X]"))
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        )
     )
-    return logging.getLogger("rich")
+
+    configured_logger.addHandler(console_handler)
+    configured_logger.addHandler(file_handler)
+    LOGGER_FILE_PATH = log_file
+    logger = configured_logger
+    return configured_logger
 
 
-logger = None
+logger = logging.getLogger(LOGGER_NAME)
+
+
+def _ensure_logger(timestamp=None):
+    global logger
+
+    if not logger.handlers:
+        logger = setup_logger(timestamp=timestamp)
+    elif timestamp is not None:
+        requested_log_file = os.path.join("log", f"sim_{timestamp}.log")
+        if LOGGER_FILE_PATH != requested_log_file:
+            logger = setup_logger(timestamp=timestamp)
+
+    return logger
+
+
+def _get_log_file_path():
+    return LOGGER_FILE_PATH or "not configured"
+
+
+def _format_stat_block(name, values, precision=4):
+    series = np.asarray(values, dtype=float)
+    if series.size == 0:
+        return f"{name}: no data"
+
+    std_value = np.std(series, ddof=1) if series.size > 1 else 0.0
+    return (
+        f"{name}: mean={np.mean(series):.{precision}f}, std={std_value:.{precision}f}, "
+        f"min={np.min(series):.{precision}f}, max={np.max(series):.{precision}f}"
+    )
+
+
+def _build_summary_text(title, *lines):
+    return "\n".join([f"=== {title} ===", *[f"- {line}" for line in lines if line]])
+
+
+def _format_plot_path(plot_path):
+    return plot_path if plot_path else "not generated"
+
+
+def _compute_relative_change(values):
+    if len(values) < 2:
+        return None
+
+    prev_value = values[-2]
+    return (values[-1] - prev_value) / max(abs(prev_value), 1e-12)
+
+
+def _build_param_text(params, title=None, exclude_keys=None):
+    if not params:
+        return ""
+
+    exclude_keys = set(exclude_keys or [])
+    lines = [f"{k}: {v}" for k, v in params.items() if k not in exclude_keys]
+    if title:
+        lines.insert(0, title)
+    return "\n".join(lines)
+
+
+def _style_axis(ax, xlabel, ylabel):
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.tick_params(axis="both", labelsize=10)
+    ax.grid(True, alpha=0.25, linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.set_facecolor("#fbfbfb")
+
+
+def _save_figure(fig, save_path):
+    fig.savefig(save_path, dpi=300, bbox_inches="tight", facecolor=fig.get_facecolor())
+
+
+def _plot_training_metric(
+    ax, x_values, values, title, ylabel, color, tol=None, show_convergence=False
+):
+    series = np.asarray(values, dtype=float)
+    if series.size == 0:
+        return
+
+    ax.plot(x_values, series, marker="o", markersize=5.5, linewidth=2.2, color=color)
+    ax.scatter(
+        [x_values[-1]],
+        [series[-1]],
+        s=90,
+        color=color,
+        edgecolors="white",
+        linewidths=1.2,
+        zorder=4,
+    )
+    ax.axhline(series[-1], color=color, linestyle="--", linewidth=1.1, alpha=0.35)
+
+    annotation = f"Final: {series[-1]:.3f}"
+    if series.size > 1:
+        annotation += f"\nΔ vs prev: {series[-1] - series[-2]:+.3f}"
+
+    ax.annotate(
+        annotation,
+        xy=(x_values[-1], series[-1]),
+        xytext=(12, 12),
+        textcoords="offset points",
+        fontsize=10,
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.9),
+        arrowprops=dict(arrowstyle="->", color=color, lw=1.1),
+    )
+
+    if show_convergence and tol is not None and series.size > 1:
+        prev_value = series[-2]
+        relative_change = (series[-1] - prev_value) / max(abs(prev_value), 1e-12)
+        if relative_change < tol:
+            ax.axvline(
+                x_values[-1], color="dimgray", linestyle=":", linewidth=1.4, alpha=0.8
+            )
+            ax.text(
+                0.03,
+                0.95,
+                f"Stop criterion met\nΔ={relative_change:.2%} < tol {tol:.2%}",
+                transform=ax.transAxes,
+                va="top",
+                fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.85),
+            )
+
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    _style_axis(ax, "Iteration", ylabel)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+
+def _plot_distribution_panel(ax_hist, ax_box, values, title, xlabel, color):
+    series = np.asarray(values, dtype=float)
+    bins = min(20, max(6, int(np.sqrt(max(series.size, 1))) * 2))
+    mean_value = float(np.mean(series))
+    median_value = float(np.median(series))
+    std_value = float(np.std(series, ddof=1)) if series.size > 1 else 0.0
+    q1, q3 = np.percentile(series, [25, 75])
+    p10, p90 = np.percentile(series, [10, 90])
+
+    counts, _, _ = ax_hist.hist(
+        series,
+        bins=bins,
+        color=color,
+        alpha=0.7,
+        edgecolor="white",
+        linewidth=1.0,
+    )
+    ax_hist.axvspan(p10, p90, color=color, alpha=0.1, label="10th–90th pct")
+    ax_hist.axvline(
+        mean_value, color=color, linewidth=2.0, label=f"Mean {mean_value:.3f}"
+    )
+    ax_hist.axvline(
+        median_value,
+        color="black",
+        linestyle="--",
+        linewidth=1.8,
+        label=f"Median {median_value:.3f}",
+    )
+    ax_hist.set_title(title, fontsize=14, fontweight="bold")
+    _style_axis(ax_hist, xlabel, "Run count")
+    ax_hist.legend(loc="upper left", fontsize=9, frameon=True)
+    ax_hist.text(
+        0.98,
+        0.95,
+        "\n".join(
+            [
+                f"μ = {mean_value:.3f}",
+                f"med = {median_value:.3f}",
+                f"σ = {std_value:.3f}",
+                f"IQR = {q1:.3f}–{q3:.3f}",
+                f"80% = {p10:.3f}–{p90:.3f}",
+            ]
+        ),
+        transform=ax_hist.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.9),
+    )
+    if len(counts):
+        ax_hist.set_ylim(0, max(counts) * 1.15 + 0.1)
+
+    boxplot = ax_box.boxplot(
+        series,
+        vert=False,
+        patch_artist=True,
+        widths=0.5,
+        showmeans=True,
+        showfliers=False,
+        meanprops=dict(
+            marker="D",
+            markerfacecolor=color,
+            markeredgecolor="white",
+            markersize=6,
+        ),
+        boxprops=dict(facecolor="white", edgecolor=color, linewidth=1.5),
+        whiskerprops=dict(color=color, linewidth=1.3),
+        capprops=dict(color=color, linewidth=1.3),
+        medianprops=dict(color="black", linewidth=2.0),
+    )
+    rng = np.random.default_rng(0)
+    jitter = rng.uniform(-0.08, 0.08, size=series.size)
+    ax_box.scatter(
+        series,
+        1 + jitter,
+        s=20,
+        color=color,
+        alpha=0.5,
+        edgecolors="white",
+        linewidths=0.4,
+        zorder=3,
+    )
+    ax_box.axvline(mean_value, color=color, linewidth=1.6, alpha=0.65)
+    ax_box.axvline(
+        median_value, color="black", linestyle="--", linewidth=1.3, alpha=0.75
+    )
+    ax_box.set_yticks([])
+    _style_axis(ax_box, xlabel, "")
+    ax_box.grid(True, axis="x", alpha=0.25, linewidth=0.8)
+    ax_box.grid(False, axis="y")
+    boxplot["boxes"][0].set_alpha(0.95)
+
+
+def _plot_comparison_panel(ax, grouped_values, labels, title, xlabel, ylabel, color):
+    positions = np.arange(1, len(grouped_values) + 1)
+    violin = ax.violinplot(
+        grouped_values,
+        positions=positions,
+        widths=0.85,
+        showmeans=False,
+        showmedians=False,
+        showextrema=False,
+    )
+    for body in violin["bodies"]:
+        body.set_facecolor(color)
+        body.set_edgecolor(color)
+        body.set_alpha(0.18)
+
+    ax.boxplot(
+        grouped_values,
+        positions=positions,
+        widths=0.26,
+        patch_artist=True,
+        showfliers=False,
+        boxprops=dict(facecolor="white", edgecolor=color, linewidth=1.4),
+        whiskerprops=dict(color=color, linewidth=1.2),
+        capprops=dict(color=color, linewidth=1.2),
+        medianprops=dict(color="black", linewidth=2.0),
+    )
+
+    rng = np.random.default_rng(7)
+    means = []
+    medians = []
+    for position, values in zip(positions, grouped_values):
+        series = np.asarray(values, dtype=float)
+        means.append(float(np.mean(series)))
+        medians.append(float(np.median(series)))
+        jitter = rng.uniform(-0.11, 0.11, size=series.size)
+        ax.scatter(
+            np.full(series.size, position) + jitter,
+            series,
+            s=22,
+            color=color,
+            alpha=0.45,
+            edgecolors="white",
+            linewidths=0.45,
+            zorder=3,
+        )
+
+    ax.plot(
+        positions,
+        means,
+        color=color,
+        linestyle="--",
+        linewidth=1.9,
+        marker="D",
+        markersize=5.5,
+        label="Mean",
+    )
+    ax.plot(
+        positions,
+        medians,
+        color="black",
+        linewidth=1.5,
+        marker="o",
+        markersize=4.5,
+        label="Median",
+    )
+
+    best_idx = int(np.argmax(means))
+    ax.annotate(
+        f"Best mean: {labels[best_idx]} ({means[best_idx]:.3f})",
+        xy=(positions[best_idx], means[best_idx]),
+        xytext=(0, 14),
+        textcoords="offset points",
+        ha="center",
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.9),
+    )
+
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    _style_axis(ax, xlabel, ylabel)
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels)
+    ax.legend(loc="best", fontsize=9, frameon=True)
 
 
 # ==========================================
@@ -432,35 +762,64 @@ class TopWordsTopicModel:
         return {"f1": np.mean(seg_f1), "topic_acc": np.mean(topic_acc)}
 
     def plot_metrics(self, save_path="training_metrics.png", params=None):
-        fig = plt.figure(figsize=(18, 6))
+        iterations = np.arange(1, len(self.history["likelihood"]) + 1)
+        fig = plt.figure(figsize=(19, 6.8), facecolor="white")
+        fig.suptitle(
+            "Single-Run Training Metrics",
+            fontsize=18,
+            fontweight="bold",
+            y=0.995,
+        )
 
         ax1 = fig.add_subplot(1, 3, 1)
-        ax1.plot(self.history["likelihood"], marker="o", color="steelblue")
-        ax1.set_title("Log Likelihood")
-        ax2 = fig.add_subplot(1, 3, 2)
-        ax2.plot(self.history["f1"], marker="o", color="forestgreen")
-        ax2.set_title("Segmentation F1")
-        ax3 = fig.add_subplot(1, 3, 3)
-        ax3.plot(self.history["topic_acc"], marker="o", color="darkorange")
-        ax3.set_title("Topic Accuracy")
+        _plot_training_metric(
+            ax1,
+            iterations,
+            self.history["likelihood"],
+            "Log Likelihood",
+            "Log likelihood",
+            "steelblue",
+            tol=params.get("tol") if params else None,
+            show_convergence=True,
+        )
 
-        if params:
-            param_str = "\n".join(
-                [f"{k}: {v}" for k, v in params.items() if k != "num_workers"]
-            )
+        ax2 = fig.add_subplot(1, 3, 2)
+        _plot_training_metric(
+            ax2,
+            iterations,
+            self.history["f1"],
+            "Segmentation Quality",
+            "F1 score",
+            "forestgreen",
+        )
+
+        ax3 = fig.add_subplot(1, 3, 3)
+        _plot_training_metric(
+            ax3,
+            iterations,
+            self.history["topic_acc"],
+            "Topic Assignment Quality",
+            "Accuracy",
+            "darkorange",
+        )
+
+        param_str = _build_param_text(
+            params, title="Run Parameters", exclude_keys={"num_workers"}
+        )
+        if param_str:
             fig.text(
-                0.98,
+                0.985,
                 0.5,
                 param_str,
                 va="center",
                 ha="right",
-                fontsize=11,
-                bbox=dict(boxstyle="round,pad=1.0", facecolor="wheat", alpha=0.3),
+                fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.7", facecolor="wheat", alpha=0.28),
             )
 
-        plt.tight_layout(rect=[0, 0, 0.9, 1])
-        plt.savefig(save_path)
-        plt.close()
+        fig.tight_layout(rect=[0, 0, 0.88, 0.96])
+        _save_figure(fig, save_path)
+        plt.close(fig)
 
 
 import seaborn as sns
@@ -533,9 +892,7 @@ def run_test(
     tol=0.01,
     use_threads=False,
 ):
-    global logger
-    if logger is None:
-        logger = setup_logger(timestamp=timestamp)
+    _ensure_logger(timestamp=timestamp)
 
     # 记录运行参数
     params = {
@@ -553,7 +910,7 @@ def run_test(
         "tol": tol,
         "use_threads": use_threads,
     }
-    logger.info(f"=== Starting run with params: {params} ===")
+    logger.info(_build_summary_text("Starting Single Run", f"params: {params}"))
 
     sim = TopWordsTopicSimulator(
         num_topics=num_topics,
@@ -589,23 +946,39 @@ def run_test(
         "tol": tol,
     }
 
+    plot_path = None
     if plot:
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         plot_dir = "results/plot/single"
         if not os.path.exists(plot_dir):
             os.makedirs(plot_dir)
-        save_path = os.path.join(plot_dir, f"metrics_{timestamp}.png")
-        model.plot_metrics(save_path=save_path, params=params)
-        logger.info(f"Single run plot saved to {save_path}")
+        plot_path = os.path.join(plot_dir, f"metrics_{timestamp}.png")
+        model.plot_metrics(save_path=plot_path, params=params)
+        logger.info(f"Single run plot saved to {plot_path}")
+
+    completed_iterations = len(model.history["likelihood"])
+    likelihood_change = _compute_relative_change(model.history["likelihood"])
+    summary_lines = [
+        f"iterations_completed: {completed_iterations}/{iterations}",
+        f"final_likelihood: {model.history['likelihood'][-1]:.2f}",
+        (
+            f"last_likelihood_change: {likelihood_change:.4%}"
+            if likelihood_change is not None
+            else "last_likelihood_change: n/a"
+        ),
+        f"final_f1: {model.history['f1'][-1]:.4f}",
+        f"final_topic_acc: {model.history['topic_acc'][-1]:.4f}",
+        f"plot_path: {_format_plot_path(plot_path)}",
+        f"log_file: {_get_log_file_path()}",
+    ]
+    logger.info(_build_summary_text("Single Run Summary", *summary_lines))
 
     return {"f1": model.history["f1"][-1], "topic_acc": model.history["topic_acc"][-1]}
 
 
 def run_distribution_test(n_runs=100, timestamp=None, **kwargs):
-    global logger
-    if logger is None:
-        logger = setup_logger(timestamp=timestamp)
+    _ensure_logger(timestamp=timestamp)
 
     results = []
     for i in range(n_runs):
@@ -616,26 +989,42 @@ def run_distribution_test(n_runs=100, timestamp=None, **kwargs):
     f1s = [r["f1"] for r in results]
     accs = [r["topic_acc"] for r in results]
 
-    fig = plt.figure(figsize=(16, 7))
-
-    ax1 = fig.add_subplot(1, 2, 1)
-    ax1.hist(
-        f1s, bins=min(20, n_runs), color="forestgreen", alpha=0.6, edgecolor="white"
+    plot_path = None
+    fig = plt.figure(figsize=(18, 9), facecolor="white")
+    fig.suptitle(
+        f"Distribution Across {n_runs} Independent Runs",
+        fontsize=18,
+        fontweight="bold",
+        y=0.99,
     )
-    ax1.set_title(f"Segmentation F1 Distribution ({n_runs} runs)")
-    ax1.set_xlabel("F1 Score")
+    grid = fig.add_gridspec(2, 2, height_ratios=[3.2, 1.2])
 
-    ax2 = fig.add_subplot(1, 2, 2)
-    ax2.hist(
-        accs, bins=min(20, n_runs), color="darkorange", alpha=0.6, edgecolor="white"
+    ax1 = fig.add_subplot(grid[0, 0])
+    ax2 = fig.add_subplot(grid[0, 1])
+    ax3 = fig.add_subplot(grid[1, 0])
+    ax4 = fig.add_subplot(grid[1, 1])
+
+    _plot_distribution_panel(
+        ax1,
+        ax3,
+        f1s,
+        "Segmentation F1 Distribution",
+        "F1 score",
+        "forestgreen",
     )
-    ax2.set_title(f"Topic Accuracy Distribution ({n_runs} runs)")
-    ax2.set_xlabel("Accuracy")
+    _plot_distribution_panel(
+        ax2,
+        ax4,
+        accs,
+        "Topic Accuracy Distribution",
+        "Accuracy",
+        "darkorange",
+    )
 
     params_for_display = {**kwargs}
     params_for_display["n_runs"] = n_runs
-    param_str = "\n".join(
-        [f"{k}: {v}" for k, v in params_for_display.items() if k != "num_workers"]
+    param_str = _build_param_text(
+        params_for_display, title="Run Parameters", exclude_keys={"num_workers"}
     )
 
     fig.text(
@@ -648,7 +1037,7 @@ def run_distribution_test(n_runs=100, timestamp=None, **kwargs):
         bbox=dict(boxstyle="round,pad=1.0", facecolor="wheat", alpha=0.3),
     )
 
-    plt.tight_layout(rect=[0, 0, 0.9, 1])
+    fig.tight_layout(rect=[0, 0, 0.88, 0.96])
 
     plot_dir = "results/plot/dist"
     if not os.path.exists(plot_dir):
@@ -656,16 +1045,24 @@ def run_distribution_test(n_runs=100, timestamp=None, **kwargs):
 
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = os.path.join(plot_dir, f"dist_{timestamp}.png")
-    plt.savefig(save_path)
-    logger.info(f"Distribution plot saved to {save_path}")
+    plot_path = os.path.join(plot_dir, f"dist_{timestamp}.png")
+    _save_figure(fig, plot_path)
+    logger.info(f"Distribution plot saved to {plot_path}")
     plt.show()
+    plt.close(fig)
+
+    summary_lines = [
+        f"runs: {n_runs}",
+        _format_stat_block("f1", f1s),
+        _format_stat_block("topic_acc", accs),
+        f"plot_path: {_format_plot_path(plot_path)}",
+        f"log_file: {_get_log_file_path()}",
+    ]
+    logger.info(_build_summary_text("Distribution Summary", *summary_lines))
 
 
 def run_comparison_test(target_param, param_list, n_runs=10, timestamp=None, **kwargs):
-    global logger
-    if logger is None:
-        logger = setup_logger(timestamp=timestamp)
+    _ensure_logger(timestamp=timestamp)
 
     all_f1s = []
     all_accs = []
@@ -683,26 +1080,52 @@ def run_comparison_test(target_param, param_list, n_runs=10, timestamp=None, **k
         all_f1s.append(f1s)
         all_accs.append(accs)
 
-    fig = plt.figure(figsize=(16, 8))
+        logger.info(
+            _build_summary_text(
+                f"{target_param}={val} Aggregate",
+                _format_stat_block("f1", f1s),
+                _format_stat_block("topic_acc", accs),
+            )
+        )
+
+    labels = [str(v) for v in param_list]
+    plot_path = None
+    fig = plt.figure(figsize=(18, 8.5), facecolor="white")
+    fig.suptitle(
+        f"Sensitivity to {target_param}",
+        fontsize=18,
+        fontweight="bold",
+        y=0.99,
+    )
 
     ax1 = fig.add_subplot(1, 2, 1)
-    ax1.boxplot(all_f1s, labels=[str(v) for v in param_list])
-    ax1.set_title(f"F1 vs {target_param}")
-    ax1.set_ylabel("Segmentation F1")
-    ax1.set_xlabel(target_param)
+    _plot_comparison_panel(
+        ax1,
+        all_f1s,
+        labels,
+        f"Segmentation F1 vs {target_param}",
+        target_param,
+        "Segmentation F1",
+        "forestgreen",
+    )
 
     ax2 = fig.add_subplot(1, 2, 2)
-    ax2.boxplot(all_accs, labels=[str(v) for v in param_list])
-    ax2.set_title(f"Acc vs {target_param}")
-    ax2.set_ylabel("Topic Accuracy")
-    ax2.set_xlabel(target_param)
+    _plot_comparison_panel(
+        ax2,
+        all_accs,
+        labels,
+        f"Topic Accuracy vs {target_param}",
+        target_param,
+        "Topic Accuracy",
+        "darkorange",
+    )
 
     fixed_params = {
         k: v for k, v in kwargs.items() if k != target_param and k != "num_workers"
     }
     fixed_params["n_runs"] = n_runs
-    param_str = "Fixed Parameters:\n" + "\n".join(
-        [f"{k}: {v}" for k, v in fixed_params.items()]
+    param_str = _build_param_text(
+        fixed_params, title="Fixed Parameters", exclude_keys={"num_workers"}
     )
 
     fig.text(
@@ -715,7 +1138,7 @@ def run_comparison_test(target_param, param_list, n_runs=10, timestamp=None, **k
         bbox=dict(boxstyle="round,pad=1.0", facecolor="wheat", alpha=0.3),
     )
 
-    plt.tight_layout(rect=[0, 0, 0.9, 1])
+    fig.tight_layout(rect=[0, 0, 0.88, 0.95])
 
     plot_dir = "results/plot/compare"
     if not os.path.exists(plot_dir):
@@ -723,10 +1146,35 @@ def run_comparison_test(target_param, param_list, n_runs=10, timestamp=None, **k
 
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = os.path.join(plot_dir, f"compare_{target_param}_{timestamp}.png")
-    plt.savefig(save_path)
-    logger.info(f"Comparison plot saved to {save_path}")
+    plot_path = os.path.join(plot_dir, f"compare_{target_param}_{timestamp}.png")
+    _save_figure(fig, plot_path)
+    logger.info(f"Comparison plot saved to {plot_path}")
     plt.show()
+    plt.close(fig)
+
+    f1_means = [float(np.mean(values)) for values in all_f1s]
+    acc_means = [float(np.mean(values)) for values in all_accs]
+    best_f1_idx = int(np.argmax(f1_means))
+    best_acc_idx = int(np.argmax(acc_means))
+    per_value_summary = "; ".join(
+        [
+            (
+                f"{label}: f1={f1_means[idx]:.4f}±{(np.std(all_f1s[idx], ddof=1) if len(all_f1s[idx]) > 1 else 0.0):.4f}, "
+                f"acc={acc_means[idx]:.4f}±{(np.std(all_accs[idx], ddof=1) if len(all_accs[idx]) > 1 else 0.0):.4f}"
+            )
+            for idx, label in enumerate(labels)
+        ]
+    )
+    summary_lines = [
+        f"target_param: {target_param}",
+        f"runs_per_value: {n_runs}",
+        f"best_mean_f1: {labels[best_f1_idx]} ({f1_means[best_f1_idx]:.4f})",
+        f"best_mean_topic_acc: {labels[best_acc_idx]} ({acc_means[best_acc_idx]:.4f})",
+        f"per_value: {per_value_summary}",
+        f"plot_path: {_format_plot_path(plot_path)}",
+        f"log_file: {_get_log_file_path()}",
+    ]
+    logger.info(_build_summary_text("Comparison Summary", *summary_lines))
 
 
 def plot_topic_dist_similarity(model, save_path="topic_similarity.png"):
