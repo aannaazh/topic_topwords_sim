@@ -656,11 +656,21 @@ class TopWordsTopicModel:
             curr = ptr[curr]
         return res[::-1]
 
-    def train(self, corpus, iterations=5, num_workers=4, tol=0.01, use_threads=False):
+    def train(
+        self,
+        corpus,
+        iterations=5,
+        num_workers=4,
+        tol=0.0001,
+        use_threads=False,
+        min_iters_before_stop=5,
+        early_stop_patience=5,
+    ):
         D = len(corpus)
         self.theta = np.random.dirichlet([self.alpha_p] * self.K, size=D)
         pi = [[0.5 for _ in d["sentences"]] for d in corpus]
         self.history = {"likelihood": [], "f1": [], "topic_acc": []}
+        no_improve_steps = 0
 
         for it in range(iterations):
             start_time = time.time()
@@ -732,11 +742,24 @@ class TopWordsTopicModel:
             if it > 0:
                 prev_likelihood = self.history["likelihood"][-2]
                 improvement = (total_likelihood - prev_likelihood) / abs(
-                    prev_likelihood
+                    prev_likelihood if prev_likelihood != 0 else 1e-12
                 )
+                if tol <= 0:
+                    continue
+
+                if (it + 1) < min_iters_before_stop:
+                    continue
+
                 if improvement < tol:
+                    no_improve_steps += 1
+                else:
+                    no_improve_steps = 0
+
+                if no_improve_steps >= early_stop_patience:
                     logger.info(
-                        f"Converged at iteration {it} (improvement {improvement:.4%} < {tol:.4%})"
+                        "Converged at iteration "
+                        f"{it} (improvement {improvement:.4%} < {tol:.4%}, "
+                        f"patience={early_stop_patience}, min_iters={min_iters_before_stop})"
                     )
                     break
 
@@ -940,8 +963,10 @@ def run_test(
     num_workers=4,
     plot=True,
     timestamp=None,
-    tol=0.01,
+    tol=0.0001,
     use_threads=False,
+    min_iters_before_stop=5,
+    early_stop_patience=5,
     vocab_strategy="discover",
     vocab_min_freq=2,
     vocab_max_candidates=None,
@@ -963,6 +988,8 @@ def run_test(
         "num_workers": num_workers,
         "tol": tol,
         "use_threads": use_threads,
+        "min_iters_before_stop": min_iters_before_stop,
+        "early_stop_patience": early_stop_patience,
         "vocab_strategy": vocab_strategy,
         "vocab_min_freq": vocab_min_freq,
         "vocab_max_candidates": vocab_max_candidates,
@@ -1007,6 +1034,8 @@ def run_test(
         num_workers=num_workers,
         tol=tol,
         use_threads=use_threads,
+        min_iters_before_stop=min_iters_before_stop,
+        early_stop_patience=early_stop_patience,
     )
 
     params = {
@@ -1022,6 +1051,8 @@ def run_test(
         "iterations": iterations,
         "num_workers": num_workers,
         "tol": tol,
+        "min_iters_before_stop": min_iters_before_stop,
+        "early_stop_patience": early_stop_patience,
         "vocab_strategy": vocab_strategy,
         "vocab_min_freq": vocab_min_freq,
         "vocab_max_candidates": vocab_max_candidates,
@@ -1369,8 +1400,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tol",
         type=float,
-        default=0.001,
+        default=0.0001,
         help="Convergence tolerance (fractional improvement in likelihood)",
+    )
+    parser.add_argument(
+        "--min_iters_before_stop",
+        type=int,
+        default=5,
+        help="Minimum number of iterations before early stopping is allowed",
+    )
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=5,
+        help="Stop only after this many consecutive below-tol improvements",
     )
 
     parser.add_argument(
@@ -1411,6 +1454,8 @@ if __name__ == "__main__":
         "iterations": args.iterations,
         "num_workers": args.workers,
         "tol": args.tol,
+        "min_iters_before_stop": args.min_iters_before_stop,
+        "early_stop_patience": args.early_stop_patience,
     }
 
     if args.mode == "single":
