@@ -1048,7 +1048,8 @@ def run_distribution_test(n_runs=100, timestamp=None, **kwargs):
     plot_path = os.path.join(plot_dir, f"dist_{timestamp}.png")
     _save_figure(fig, plot_path)
     logger.info(f"Distribution plot saved to {plot_path}")
-    plt.show()
+    if plt.get_backend().lower() not in ("agg", "pdf", "svg", "pgf", "cairo"):
+        plt.show()
     plt.close(fig)
 
     summary_lines = [
@@ -1149,7 +1150,8 @@ def run_comparison_test(target_param, param_list, n_runs=10, timestamp=None, **k
     plot_path = os.path.join(plot_dir, f"compare_{target_param}_{timestamp}.png")
     _save_figure(fig, plot_path)
     logger.info(f"Comparison plot saved to {plot_path}")
-    plt.show()
+    if plt.get_backend().lower() not in ("agg", "pdf", "svg", "pgf", "cairo"):
+        plt.show()
     plt.close(fig)
 
     f1_means = [float(np.mean(values)) for values in all_f1s]
