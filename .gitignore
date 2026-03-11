@@ -20,3 +20,6 @@ results/
 
 # Ruff cache
 .ruff_cache/
+
+# Local agent workspace
+.sisyphus/
