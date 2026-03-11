@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+
+# Logs
+log/
+
+# Results (generated outputs)
+results/
+
+# Generated images
+*.png
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Ruff cache
+.ruff_cache/
