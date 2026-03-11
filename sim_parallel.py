@@ -1098,12 +1098,12 @@ class TopWordsTopicModel:
 
             # M-Step
             for t in range(self.K + 1):
-                self.phi[t] = (new_n_ti[t] + self.beta_p - 1) / (
-                    np.sum(new_n_ti[t]) + self.V * (self.beta_p - 1) + 1e-20
+                self.phi[t] = (new_n_ti[t] + self.beta_p) / (
+                    np.sum(new_n_ti[t]) + self.V * self.beta_p + 1e-20
                 )
             for d in range(D):
-                self.theta[d] = (new_n_dt[d] + self.alpha_p - 1) / (
-                    np.sum(new_n_dt[d]) + self.K * (self.alpha_p - 1) + 1e-20
+                self.theta[d] = (new_n_dt[d] + self.alpha_p) / (
+                    np.sum(new_n_dt[d]) + self.K * self.alpha_p + 1e-20
                 )
 
             for d in range(D):
@@ -1142,19 +1142,21 @@ class TopWordsTopicModel:
                 f"Iteration {it} | Likelihood: {total_likelihood:.2f} | F1: {metrics['f1']:.4f} | Topic Acc: {metrics['topic_acc']:.4f} | Entropy: {metrics['topic_entropy']:.4f} | EffVocab95: {metrics['effective_vocab95']:.4f} | Time: {duration:.2f}s"
             )
 
-            # Early stopping check
+            # Early stopping check: stop only when BOTH F1 and TopicAcc plateau
             if it > 0:
-                prev_likelihood = self.history["likelihood"][-2]
-                improvement = (total_likelihood - prev_likelihood) / abs(
-                    prev_likelihood if prev_likelihood != 0 else 1e-12
-                )
+                prev_f1 = self.history["f1"][-2]
+                prev_topic_acc = self.history["topic_acc"][-2]
+                f1_gain = metrics["f1"] - prev_f1
+                topic_acc_gain = metrics["topic_acc"] - prev_topic_acc
+
                 if tol <= 0:
                     continue
 
                 if (it + 1) < min_iters_before_stop:
                     continue
 
-                if improvement < tol:
+                both_plateau = f1_gain <= tol and topic_acc_gain <= tol
+                if both_plateau:
                     no_improve_steps += 1
                 else:
                     no_improve_steps = 0
@@ -1162,8 +1164,9 @@ class TopWordsTopicModel:
                 if no_improve_steps >= early_stop_patience:
                     logger.info(
                         "Converged at iteration "
-                        f"{it} (improvement {improvement:.4%} < {tol:.4%}, "
-                        f"patience={early_stop_patience}, min_iters={min_iters_before_stop})"
+                        f"{it} (f1_gain={f1_gain:+.4g}, topic_acc_gain={topic_acc_gain:+.4g}, "
+                        f"tol={tol:.1e}, patience={early_stop_patience}, "
+                        f"min_iters={min_iters_before_stop})"
                     )
                     break
 
@@ -1398,10 +1401,10 @@ class ModelDiagnostics:
 # ==========================================
 def run_test(
     num_topics=2,
-    char_size=500,
+    char_size=50,
     vocab_size=1000,
     max_word_len=4,
-    single_char_ratio=0.3,
+    single_char_ratio=0.1,
     alpha=0.1,
     beta=0.01,
     num_docs=1000,
@@ -1410,12 +1413,12 @@ def run_test(
     num_workers=4,
     plot=True,
     timestamp=None,
-    tol=0.0001,
+    tol=0.00005,
     use_threads=False,
-    min_iters_before_stop=5,
-    early_stop_patience=5,
+    min_iters_before_stop=10,
+    early_stop_patience=8,
     vocab_strategy="discover",
-    vocab_min_freq=2,
+    vocab_min_freq=1,
     vocab_max_candidates=None,
 ):
     _ensure_logger(timestamp=timestamp)
@@ -1478,7 +1481,7 @@ def run_test(
             f"Unknown vocab_strategy: {vocab_strategy}. Expected 'discover' or 'oracle'."
         )
 
-    model = TopWordsTopicModel(model_dictionary, K=num_topics)
+    model = TopWordsTopicModel(model_dictionary, K=num_topics, alpha=alpha, beta=beta)
     model.gt_pi_values = gt_pi_values
     model.train(
         corpus,
@@ -1573,10 +1576,10 @@ def run_test(
 
 def run_baseline_comparison(
     num_topics=2,
-    char_size=500,
+    char_size=50,
     vocab_size=1000,
     max_word_len=4,
-    single_char_ratio=0.3,
+    single_char_ratio=0.1,
     alpha=0.1,
     beta=0.01,
     num_docs=1000,
@@ -1584,12 +1587,12 @@ def run_baseline_comparison(
     iterations=10,
     num_workers=4,
     timestamp=None,
-    tol=0.0001,
+    tol=0.00005,
     use_threads=False,
-    min_iters_before_stop=5,
-    early_stop_patience=5,
+    min_iters_before_stop=10,
+    early_stop_patience=8,
     vocab_strategy="discover",
-    vocab_min_freq=2,
+    vocab_min_freq=1,
     vocab_max_candidates=None,
 ):
     _ensure_logger(timestamp=timestamp)
@@ -1624,7 +1627,9 @@ def run_baseline_comparison(
         [sent["gt_pi"] for doc in corpus for sent in doc["sentences"]], dtype=float
     )
 
-    model_main = TopWordsTopicModel(model_dictionary, K=num_topics)
+    model_main = TopWordsTopicModel(
+        model_dictionary, K=num_topics, alpha=alpha, beta=beta
+    )
     model_main.gt_pi_values = gt_pi_values
 
     true_vocab_set = set(sim.word_dict)
@@ -1647,7 +1652,9 @@ def run_baseline_comparison(
         "topic_acc": model_main.history["topic_acc"][-1],
     }
 
-    model_base = TopWordsTopicModel(model_dictionary, K=num_topics)
+    model_base = TopWordsTopicModel(
+        model_dictionary, K=num_topics, alpha=alpha, beta=beta
+    )
     model_base.train_baseline_lda(corpus, iterations=iterations)
     dummy_pi = [[0.5 for _ in d["sentences"]] for d in corpus]
     base_eval_viterbi = model_base.evaluate(corpus, dummy_pi)
@@ -1975,7 +1982,7 @@ if __name__ == "__main__":
         "--workers", type=int, default=8, help="Number of parallel workers"
     )
     parser.add_argument("--num_topics", type=int, default=10, help="Number of topics")
-    parser.add_argument("--char_size", type=int, default=500, help="Character set size")
+    parser.add_argument("--char_size", type=int, default=50, help="Character set size")
     parser.add_argument("--vocab_size", type=int, default=1000, help="Vocabulary size")
     parser.add_argument(
         "--max_word_len", type=int, default=4, help="Maximum word length"
@@ -1983,7 +1990,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--single_char_ratio",
         type=float,
-        default=0.3,
+        default=0.1,
         help="Ratio of single-char words",
     )
     parser.add_argument("--alpha", type=float, default=0.1, help="Alpha prior")
@@ -1998,14 +2005,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--vocab_min_freq",
         type=int,
-        default=2,
-        help="Minimum n-gram frequency for discovered vocabulary",
+        default=1,
+        help="Minimum n-gram frequency for discovered vocabulary (1 = highest recall)",
     )
     parser.add_argument(
         "--vocab_max_candidates",
         type=int,
         default=0,
-        help="Maximum vocabulary size after frequency filtering (0 means unlimited)",
+        help="Maximum vocabulary size after frequency filtering (0 means unlimited, recall-first)",
     )
     parser.add_argument(
         "--sents_per_doc", type=int, default=10, help="Sentences per document"
@@ -2014,19 +2021,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tol",
         type=float,
-        default=0.0001,
-        help="Convergence tolerance (fractional improvement in likelihood)",
+        default=0.00005,
+        help="Minimum required gain for BOTH F1 and TopicAcc; early stop when both gains stay <= tol",
     )
     parser.add_argument(
         "--min_iters_before_stop",
         type=int,
-        default=5,
+        default=10,
         help="Minimum number of iterations before early stopping is allowed",
     )
     parser.add_argument(
         "--early_stop_patience",
         type=int,
-        default=5,
+        default=8,
         help="Stop only after this many consecutive below-tol improvements",
     )
 
