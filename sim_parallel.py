@@ -9,6 +9,7 @@ import time
 import os
 import logging
 from datetime import datetime
+from collections import Counter
 from rich.logging import RichHandler
 from rich.console import Console
 
@@ -395,9 +396,10 @@ class TopWordsTopicSimulator:
         self.beta = beta
         self.gamma = gamma
         self.chars = [chr(i + 0x4E00) for i in range(self.char_size)]
-        self.word_dict = self._generate_vocabulary()
+        self.true_word_dict = self._generate_vocabulary()
+        self.word_dict = self.true_word_dict
         self.phi = np.random.dirichlet(
-            [self.beta] * len(self.word_dict), size=self.K + 1
+            [self.beta] * len(self.true_word_dict), size=self.K + 1
         )
 
     def _generate_vocabulary(self):
@@ -437,8 +439,10 @@ class TopWordsTopicSimulator:
                 words = []
                 for _ in range(random.randint(4, 8)):
                     source = z_dn if np.random.rand() < pi_dn else 0
-                    w_idx = np.random.choice(len(self.word_dict), p=self.phi[source])
-                    words.append(self.word_dict[w_idx])
+                    w_idx = np.random.choice(
+                        len(self.true_word_dict), p=self.phi[source]
+                    )
+                    words.append(self.true_word_dict[w_idx])
 
                 doc["sentences"].append(
                     {
@@ -450,6 +454,51 @@ class TopWordsTopicSimulator:
                 )
             corpus.append(doc)
         return corpus
+
+    def discover_vocabulary(self, corpus, min_freq=2, max_candidates=None):
+        """从语料自动发现词表：枚举候选词并按词频过滤。"""
+        ngram_counts = Counter()
+
+        for doc in corpus:
+            for sent in doc["sentences"]:
+                text = sent["text"]
+                L = len(text)
+                for i in range(L):
+                    max_len = min(self.max_word_len, L - i)
+                    for l in range(1, max_len + 1):
+                        ngram_counts[text[i : i + l]] += 1
+
+        filtered = [(w, c) for w, c in ngram_counts.items() if c >= min_freq]
+        filtered.sort(key=lambda item: (-item[1], len(item[0]), item[0]))
+
+        if max_candidates is not None and max_candidates > 0:
+            filtered = filtered[:max_candidates]
+
+        discovered = [w for w, _ in filtered]
+
+        if not discovered:
+            fallback_chars = [
+                w
+                for w, _ in sorted(
+                    ((w, c) for w, c in ngram_counts.items() if len(w) == 1),
+                    key=lambda item: -item[1],
+                )
+            ]
+            discovered = fallback_chars[: max(10, min(self.char_size, 100))]
+
+        if not discovered:
+            discovered = list(self.true_word_dict)
+
+        stats = {
+            "candidate_total": len(ngram_counts),
+            "after_freq_filter": len(
+                [1 for c in ngram_counts.values() if c >= min_freq]
+            ),
+            "selected_size": len(discovered),
+            "min_freq": min_freq,
+            "max_candidates": max_candidates,
+        }
+        return discovered, stats
 
 
 # ==========================================
@@ -891,6 +940,9 @@ def run_test(
     timestamp=None,
     tol=0.01,
     use_threads=False,
+    vocab_strategy="discover",
+    vocab_min_freq=2,
+    vocab_max_candidates=None,
 ):
     _ensure_logger(timestamp=timestamp)
 
@@ -909,6 +961,9 @@ def run_test(
         "num_workers": num_workers,
         "tol": tol,
         "use_threads": use_threads,
+        "vocab_strategy": vocab_strategy,
+        "vocab_min_freq": vocab_min_freq,
+        "vocab_max_candidates": vocab_max_candidates,
     }
     logger.info(_build_summary_text("Starting Single Run", f"params: {params}"))
 
@@ -922,7 +977,22 @@ def run_test(
         beta=beta,
     )
     corpus = sim.generate_corpus(num_docs=num_docs, sents_per_doc=sents_per_doc)
-    model = TopWordsTopicModel(sim.word_dict, K=num_topics)
+
+    discovery_stats = None
+    if vocab_strategy == "discover":
+        model_dictionary, discovery_stats = sim.discover_vocabulary(
+            corpus,
+            min_freq=vocab_min_freq,
+            max_candidates=vocab_max_candidates,
+        )
+    elif vocab_strategy == "oracle":
+        model_dictionary = list(sim.word_dict)
+    else:
+        raise ValueError(
+            f"Unknown vocab_strategy: {vocab_strategy}. Expected 'discover' or 'oracle'."
+        )
+
+    model = TopWordsTopicModel(model_dictionary, K=num_topics)
     model.train(
         corpus,
         iterations=iterations,
@@ -944,6 +1014,9 @@ def run_test(
         "iterations": iterations,
         "num_workers": num_workers,
         "tol": tol,
+        "vocab_strategy": vocab_strategy,
+        "vocab_min_freq": vocab_min_freq,
+        "vocab_max_candidates": vocab_max_candidates,
     }
 
     plot_path = None
@@ -959,8 +1032,16 @@ def run_test(
 
     completed_iterations = len(model.history["likelihood"])
     likelihood_change = _compute_relative_change(model.history["likelihood"])
+    true_vocab_set = set(sim.word_dict)
+    model_vocab_set = set(model_dictionary)
+    overlap = len(true_vocab_set & model_vocab_set)
+    overlap_ratio = overlap / max(len(true_vocab_set), 1)
+
     summary_lines = [
         f"iterations_completed: {completed_iterations}/{iterations}",
+        (
+            f"vocab_size_true={len(sim.word_dict)} model={len(model_dictionary)} overlap={overlap} ({overlap_ratio:.2%})"
+        ),
         f"final_likelihood: {model.history['likelihood'][-1]:.2f}",
         (
             f"last_likelihood_change: {likelihood_change:.4%}"
@@ -972,6 +1053,18 @@ def run_test(
         f"plot_path: {_format_plot_path(plot_path)}",
         f"log_file: {_get_log_file_path()}",
     ]
+    if discovery_stats is not None:
+        summary_lines.insert(
+            2,
+            (
+                "discovery_stats: "
+                f"candidates={discovery_stats['candidate_total']}, "
+                f"after_freq={discovery_stats['after_freq_filter']}, "
+                f"selected={discovery_stats['selected_size']}, "
+                f"min_freq={discovery_stats['min_freq']}, "
+                f"max_candidates={discovery_stats['max_candidates']}"
+            ),
+        )
     logger.info(_build_summary_text("Single Run Summary", *summary_lines))
 
     return {"f1": model.history["f1"][-1], "topic_acc": model.history["topic_acc"][-1]}
@@ -1243,6 +1336,25 @@ if __name__ == "__main__":
     parser.add_argument("--alpha", type=float, default=0.1, help="Alpha prior")
     parser.add_argument("--beta", type=float, default=0.01, help="Beta prior")
     parser.add_argument(
+        "--vocab_strategy",
+        type=str,
+        default="discover",
+        choices=["discover", "oracle"],
+        help="Vocabulary source: discover from corpus or use simulator oracle vocabulary",
+    )
+    parser.add_argument(
+        "--vocab_min_freq",
+        type=int,
+        default=2,
+        help="Minimum n-gram frequency for discovered vocabulary",
+    )
+    parser.add_argument(
+        "--vocab_max_candidates",
+        type=int,
+        default=1000,
+        help="Maximum vocabulary size after frequency filtering (0 means unlimited)",
+    )
+    parser.add_argument(
         "--sents_per_doc", type=int, default=10, help="Sentences per document"
     )
     parser.add_argument("--iterations", type=int, default=50, help="EM iterations")
@@ -1281,6 +1393,11 @@ if __name__ == "__main__":
         "single_char_ratio": args.single_char_ratio,
         "alpha": args.alpha,
         "beta": args.beta,
+        "vocab_strategy": args.vocab_strategy,
+        "vocab_min_freq": args.vocab_min_freq,
+        "vocab_max_candidates": (
+            None if args.vocab_max_candidates <= 0 else args.vocab_max_candidates
+        ),
         "num_docs": args.docs,
         "sents_per_doc": args.sents_per_doc,
         "iterations": args.iterations,
